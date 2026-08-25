@@ -24,8 +24,8 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wwrite-strings -Wpointer-arit
 
     set(CMAKE_C_FLAGS_RELEASE     "-O3 -fomit-frame-pointer -flto")
     set(CMAKE_CXX_FLAGS_RELEASE   "-O3 -fomit-frame-pointer -flto")
-    set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} -flto")
-    set(CMAKE_EXE_LINKER_FLAGS_RELEASE    "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -flto")
+    set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} -flto -s")
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE    "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -flto -s")
 
     set(CMAKE_C_FLAGS_DEBUG       "-Og -g3")
     set(CMAKE_CXX_FLAGS_DEBUG     "-Og -g3")
@@ -67,8 +67,8 @@ if(CMAKE_COMPILER_IS_GNU)
 
     set(CMAKE_C_FLAGS_RELEASE     "-O3 -fomit-frame-pointer -flto")
     set(CMAKE_CXX_FLAGS_RELEASE   "-O3 -fomit-frame-pointer -flto")
-    set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} -flto")
-    set(CMAKE_EXE_LINKER_FLAGS_RELEASE    "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -flto")
+    set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} -flto -s")
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE    "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -flto -s")
 
     set(CMAKE_C_FLAGS_DEBUG       "-Og -g3")
     set(CMAKE_CXX_FLAGS_DEBUG     "-Og -g3")

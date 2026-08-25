@@ -81,6 +81,8 @@ else
   esac
 fi
 
+DEFINE_PARAMS="$DEFINE_PARAMS -DCMAKE_BUILD_TYPE=Release"
+
 echo "Build uapki-libs used define:"
 echo "DEFINE_PARAMS: '$DEFINE_PARAMS'"
 echo "CC: '$CC'"
