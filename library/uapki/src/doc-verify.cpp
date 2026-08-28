@@ -547,7 +547,7 @@ int VerifiedSignerInfo::buildCertChain (void)
                 added_cci->setIssuer(it);
                 DO(addCertChainItem(CertEntity::INTERMEDIATE, it, &added_cci));
             }
-            added_cci->setRoot();
+            added_cci->isSelfSigned() ? added_cci->setRoot() : added_cci->setIssuer(nullptr);
         }
         else {
             m_LastError = ret;
@@ -577,7 +577,7 @@ int VerifiedSignerInfo::buildCertChain (void)
                 added_cci->setIssuer(it);
                 DO(addCertChainItem(CertEntity::INTERMEDIATE, it, &added_cci));
             }
-            added_cci->setIssuer(nullptr);
+            added_cci->isSelfSigned() ? added_cci->setRoot() : added_cci->setIssuer(nullptr);
         }
         else {
             m_LastError = ret;
