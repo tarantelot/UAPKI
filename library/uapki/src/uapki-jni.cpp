@@ -201,6 +201,40 @@ jbyteArray signCore(JNIEnv* env, const std::string& path, const std::string& pas
         return nullptr;
     }
 
+    //  Cryptonite hardcodes DSTU4145 signing to (GOST34311 digest, the
+    //  plain curve OID as signatureAlgorithm) - it never offers a hash
+    //  choice. cm-pkcs12 reports every hash combo a key's curve supports
+    //  (legacy GOST34311 and, for keys new enough to allow it, Kupyna/
+    //  DSTU7564), and leaving "signAlgo" unset makes sign.cpp's
+    //  get_info_signalgo_and_keyid() default to signAlgo[0] - which for a
+    //  real legacy key came back the Kupyna combo first, not what
+    //  Cryptonite itself produces for that same key (confirmed via a
+    //  differential test: cross-verifying through Cryptonite's own
+    //  cmsVerify() came back signStatus=INVALID from the digest/
+    //  signatureAlgorithm mismatch). Prefer the legacy GOST3411 combo when
+    //  the key supports it, to bit-for-bit match Cryptonite; fall back to
+    //  whatever cm-pkcs12 offers otherwise - real production keys that are
+    //  Kalyna/Kupyna-only (the whole reason for this migration) simply
+    //  won't have this OID in their list, so this is a no-op for them.
+    {
+        std::string keyInfoStr;
+        if (storage.keyGetInfo(keyInfoStr) == RET_OK) {
+            JSON_Value* jvKeyInfo = json_parse_string(keyInfoStr.c_str());
+            JSON_Object* joKeyInfo = jvKeyInfo ? json_value_get_object(jvKeyInfo) : nullptr;
+            JSON_Array* jaSignAlgo = joKeyInfo ? json_object_get_array(joKeyInfo, "signAlgo") : nullptr;
+            if (jaSignAlgo) {
+                for (size_t i = 0; i < json_array_get_count(jaSignAlgo); ++i) {
+                    const char* algo = json_array_get_string(jaSignAlgo, i);
+                    if (algo && oid_is_equal(algo, OID_DSTU4145_PARAM_PB_LE)) {
+                        json_object_set_string(json_value_get_object(jvSignParams), "signAlgo", algo);
+                        break;
+                    }
+                }
+            }
+            json_value_free(jvKeyInfo);
+        }
+    }
+
     ByteArray* certBa = jbyteArrayToBa(env, jCertBytes);
     if (certBa) {
         ByteArray* certId = nullptr;
@@ -419,11 +453,20 @@ JNIEXPORT jboolean JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeIsKeyPass
 }
 
 //  Matches CryptoController.signData()'s exact parameter set and behavior:
-//  - withTimestamp maps to CAdES-T (which auto-sets both includeContentTS
-//    and includeSignatureTS - see paramsBySignatureFormat() in
-//    doc-sign.cpp), CMS format otherwise. Cryptonite's TSP_URL is forced
-//    globally in nativeInit(), matching what CryptoniteX.cmsSignData did
-//    with the TSP_URL constant.
+//  - Always uses CAdES-T (always fetches a real TSP timestamp), regardless
+//    of withTimestamp. This looks wrong until you read cmsSignData's own
+//    body (CryptoniteX.java): TSP only gates on `tspURL != null`, and
+//    signData() always passes the hardcoded TSP_URL - `withTimestamp`
+//    (Cryptonite's `includeSignTime`) only controls a SEPARATE, minor
+//    local signingTime signed attribute, unrelated to whether a TSP
+//    network call happens. Confirmed against the real crypto-service
+//    Cryptonite build in a differential test: production's two signData()
+//    call sites (SfsDocService.signData/createReceiptAndSign) both pass
+//    withTimestamp=false yet cmsVerify() on their own output still showed
+//    a populated TSP token - i.e. every signData() call in production
+//    already does a real TSP round-trip today. Matching "withTimestamp
+//    disables TSP" (the obvious-looking reading) would have silently
+//    changed production behavior instead of preserving it.
 //  - certBytes is read (by the Java caller, from certificateKeyPath) and
 //    passed through unconditionally, exactly like getUserKeyCert() does -
 //    Cryptonite always loads the cert file regardless of includeCertificate.
@@ -435,12 +478,42 @@ JNIEXPORT jbyteArray JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeSignDat
 
     std::string path = jstringToStd(env, jPath);
     std::string password = jstringToStd(env, jPassword);
+    (void)withTimestamp;
 
     JSON_Value* jvSignParams = json_value_init_object();
     JSON_Object* joSignParams = json_value_get_object(jvSignParams);
-    json_object_set_string(joSignParams, "signatureFormat", withTimestamp ? "CAdES-T" : "CMS");
+    json_object_set_string(joSignParams, "signatureFormat", "CAdES-T");
     json_object_set_boolean(joSignParams, "detachedData", !includeData);
     json_object_set_boolean(joSignParams, "includeCert", includeCertificate);
+
+    return signCore(env, path, password, jData, jCertBytes, jvSignParams);
+}
+
+//  Diagnostic only, not part of CryptoController's contract: the exact
+//  detached signature nativeSignAndSetData produces internally, before its
+//  modify_cms reattachment step - lets a differential test tell apart "base
+//  signing is wrong" from "modify_cms's content-reattachment corrupts
+//  something".
+JNIEXPORT jbyteArray JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeSignDetachedNoTsp(
+        JNIEnv* env, jclass,
+        jstring jPath, jstring jPassword, jbyteArray jData, jbyteArray jCertBytes) {
+    std::string path = jstringToStd(env, jPath);
+    std::string password = jstringToStd(env, jPassword);
+
+    //  "CMS" maps to SignatureFormat::CMS_SID_KEYID, which sets
+    //  sidUseKeyId=true (SubjectKeyIdentifier SID) - Cryptonite's own
+    //  signatures always use IssuerAndSerialNumber SID instead, and its
+    //  verifier can't extract a signerId at all from a SubjectKeyIdentifier
+    //  SID (confirmed via a differential test: cross-verifying this output
+    //  through Cryptonite's own cmsVerify() came back signStatus=INVALID,
+    //  with SignInfo.getSignerId() null). "CAdES-BES" sets sidUseKeyId=false
+    //  (IssuerAndSerialNumber, matching Cryptonite) without adding TSP -
+    //  only CAdES-T turns TSP on, per paramsBySignatureFormat()'s fallthrough.
+    JSON_Value* jvSignParams = json_value_init_object();
+    JSON_Object* joSignParams = json_value_get_object(jvSignParams);
+    json_object_set_string(joSignParams, "signatureFormat", "CAdES-BES");
+    json_object_set_boolean(joSignParams, "detachedData", true);
+    json_object_set_boolean(joSignParams, "includeCert", true);
 
     return signCore(env, path, password, jData, jCertBytes, jvSignParams);
 }
@@ -460,9 +533,13 @@ JNIEXPORT jbyteArray JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeSignAnd
     std::string path = jstringToStd(env, jPath);
     std::string password = jstringToStd(env, jPassword);
 
+    //  See nativeSignDetachedNoTsp's comment: "CMS" (sidUseKeyId=true,
+    //  SubjectKeyIdentifier SID) is what Cryptonite's own verifier can't
+    //  cross-verify - "CAdES-BES" (IssuerAndSerialNumber SID) matches
+    //  Cryptonite's own convention while still adding no TSP.
     JSON_Value* jvSignParams = json_value_init_object();
     JSON_Object* joSignParams = json_value_get_object(jvSignParams);
-    json_object_set_string(joSignParams, "signatureFormat", "CMS");
+    json_object_set_string(joSignParams, "signatureFormat", "CAdES-BES");
     json_object_set_boolean(joSignParams, "detachedData", true);
     json_object_set_boolean(joSignParams, "includeCert", true);
 
