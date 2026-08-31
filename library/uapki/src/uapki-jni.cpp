@@ -43,6 +43,15 @@
 //  than left to the library default. See setupTsp() in doc-sign.cpp.
 static const char* TSP_URL = "http://acsk.privatbank.ua/services/tsp/";
 
+//  Set once by nativeInit() from the same directory the Java side already
+//  extracted every uapki .so into (see UapkiNative.java's loader) - passed
+//  explicitly to every CmStorageProxy::load("cm-pkcs12", ...) call so
+//  dlopen resolves it (and, in turn, its own libuapkic/libuapkif deps,
+//  already resident in the process by the time this runs) by absolute
+//  path, without depending on LD_LIBRARY_PATH being set correctly in
+//  whatever environment this ends up deployed in.
+static std::string g_nativeLibDir;
+
 namespace {
 
 //  Forward declarations - definitions further down are ordered for
@@ -149,7 +158,7 @@ int selectKeyFully(CmStorageProxy& storage, const ByteArray* keyId) {
 //  counts it per path, every thread just gets pointers into the one
 //  already-mapped library.
 int openAndSelectFirstKey(JNIEnv* env, CmStorageProxy& storage, const std::string& path, const std::string& password) {
-    if (!storage.load("cm-pkcs12")) {
+    if (!storage.load("cm-pkcs12", g_nativeLibDir)) {
         throwCryptoException(env, "Cant load cm-pkcs12 provider");
         return RET_UAPKI_GENERAL_ERROR;
     }
@@ -365,10 +374,17 @@ extern "C" {
 //  call-once-at-startup step (matches UAPKI's own "ST" classification for
 //  INIT) - it does not touch CmProviders' storage slot, so it doesn't
 //  conflict with per-thread signing sessions.
-JNIEXPORT jboolean JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeInit(
-        JNIEnv* env, jclass, jstring jCertCacheDir, jstring jCrlCacheDir) {
+JNIEXPORT jboolean JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeInit0(
+        JNIEnv* env, jclass, jstring jCertCacheDir, jstring jCrlCacheDir, jstring jNativeLibDir) {
     std::string certCacheDir = jstringToStd(env, jCertCacheDir);
     std::string crlCacheDir = jstringToStd(env, jCrlCacheDir);
+    g_nativeLibDir = jstringToStd(env, jNativeLibDir);
+    //  CmLoader::load() does `dir + getLibName(libName)` with no separator
+    //  inserted - g_nativeLibDir must end in one for that concatenation to
+    //  produce a valid path.
+    if (!g_nativeLibDir.empty() && g_nativeLibDir.back() != '/') {
+        g_nativeLibDir += '/';
+    }
 
     JSON_Value* jvParams = json_value_init_object();
     JSON_Object* joParams = json_value_get_object(jvParams);
@@ -407,7 +423,7 @@ JNIEXPORT jboolean JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeInit(
     //  than closed, since there's no matching nativeDeinit (crypto-service
     //  is a long-lived daemon, not something that tears this down).
     CmStorageProxy* bootstrapProxy = new CmStorageProxy();
-    if (!bootstrapProxy->load("cm-pkcs12")) {
+    if (!bootstrapProxy->load("cm-pkcs12", g_nativeLibDir)) {
         json_value_free(jvParams);
         throwCryptoException(env, "Cant load cm-pkcs12 provider");
         return JNI_FALSE;
@@ -577,6 +593,47 @@ JNIEXPORT jbyteArray JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeSignAnd
 
     if (!out) {
         throwCryptoException(env, "modify_cms (attach content) failed: " + std::to_string(ret));
+        return nullptr;
+    }
+    return out;
+}
+
+//  Matches CryptoController.getRawData()'s exact behavior (CryptoniteX.
+//  cmsGetData): extract the encapsulated content from an already-signed
+//  CMS/CAdES structure - read-only, no key/storage involved at all.
+//  uapki_modify_cms with no "add"/"remove" and options.returnContent=true
+//  parses the structure and returns the content bytes without rebuilding
+//  anything.
+JNIEXPORT jbyteArray JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeGetRawData(
+        JNIEnv* env, jclass, jbyteArray jSignedData) {
+    ByteArray* baSignedData = jbyteArrayToBa(env, jSignedData);
+
+    JSON_Value* jvParams = json_value_init_object();
+    JSON_Object* joParams = json_value_get_object(jvParams);
+    json_object_set_base64(joParams, "bytes", baSignedData);
+    JSON_Value* jvOptions = json_value_init_object();
+    json_object_set_boolean(json_value_get_object(jvOptions), "returnContent", true);
+    json_object_set_value(joParams, "options", jvOptions);
+
+    JSON_Value* jvResult = json_value_init_object();
+    JSON_Object* joResult = json_value_get_object(jvResult);
+
+    int ret = uapki_modify_cms(joParams, joResult);
+
+    jbyteArray out = nullptr;
+    if (ret == RET_OK) {
+        JSON_Object* joContent = json_object_get_object(joResult, "content");
+        ByteArray* baOut = joContent ? json_object_get_base64(joContent, "bytes") : nullptr;
+        out = baToJbyteArray(env, baOut);
+        ba_free(baOut);
+    }
+
+    ba_free(baSignedData);
+    json_value_free(jvParams);
+    json_value_free(jvResult);
+
+    if (!out) {
+        throwCryptoException(env, "getRawData (modify_cms returnContent) failed: " + std::to_string(ret));
         return nullptr;
     }
     return out;
