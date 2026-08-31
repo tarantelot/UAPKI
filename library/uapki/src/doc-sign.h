@@ -246,4 +246,17 @@ int verifySignedData (
 }   //  end namespace UapkiNS
 
 
+class CmStorageProxy;
+
+//  Same signing logic uapki_sign() (sign.cpp) uses, parametrized by an
+//  explicit storage instead of CmProviders' single process-wide "opened
+//  storage" slot. Lets independent callers (one CmStorageProxy per thread,
+//  e.g. a JNI shim) sign concurrently without serializing on that slot.
+int uapki_sign_with_storage (
+    CmStorageProxy& storage,
+    JSON_Object* joParams,
+    JSON_Object* joResult
+);
+
+
 #endif

@@ -239,7 +239,16 @@ cleanup:
     return ret;
 }   //  resultdoc_to_json
 
-int uapki_sign (
+//  Core signing logic, parametrized by an explicit storage instead of
+//  reaching into CmProviders' single process-wide "opened storage". This
+//  lets a caller (e.g. a JNI shim handing each thread its own independent
+//  CmStorageProxy) run genuinely concurrent sign operations - CmProviders'
+//  slot model only ever tracks one open storage for the whole library
+//  instance and would serialize/collide across threads. uapki_sign() below
+//  is now just this function called with the JSON-API's single global
+//  storage, so the JSON facade's behavior is unchanged.
+int uapki_sign_with_storage (
+        CmStorageProxy& storage_ref,
         JSON_Object* joParams,
         JSON_Object* joResult
 )
@@ -249,8 +258,7 @@ int uapki_sign (
     if (!cert_validator.init(get_config(), get_cerstore(), get_crlstore())) return RET_UAPKI_GENERAL_ERROR;
     if (!cert_validator.getLibConfig()->isInitialized()) return RET_UAPKI_NOT_INITIALIZED;
 
-    CmStorageProxy* storage = CmProviders::openedStorage();
-    if (!storage) return RET_UAPKI_STORAGE_NOT_OPEN;
+    CmStorageProxy* storage = &storage_ref;
     if (!storage->keyIsSelected()) return RET_UAPKI_KEY_NOT_SELECTED;
 
     int ret = RET_OK;
@@ -425,4 +433,15 @@ cleanup:
         (void)cert_validator.expectedCrlsToJson(joResult, "expectedCrls");
     }
     return ret;
+}
+
+int uapki_sign (
+        JSON_Object* joParams,
+        JSON_Object* joResult
+)
+{
+    CmStorageProxy* storage = CmProviders::openedStorage();
+    if (!storage) return RET_UAPKI_STORAGE_NOT_OPEN;
+
+    return uapki_sign_with_storage(*storage, joParams, joResult);
 }

@@ -140,6 +140,20 @@ target_include_directories(uapki ${UAPKI_INTERNAL_INCLUDES_MODE}
     ${CMAKE_CURRENT_BINARY_DIR}
 )
 
+# uapki-jni.cpp (crypto-service's per-thread signing shim, see that file's
+# header comment) needs jni.h/jni_md.h. JNI symbols themselves are resolved
+# at runtime by the JVM that dlopen()s this library - no libjvm linkage
+# needed, headers only. Not using find_package(JNI): it unconditionally
+# also demands JAWT (AWT native headers), which we have no use for and
+# aren't guaranteed to be present in a headless JDK.
+if(NOT DEFINED ENV{JAVA_HOME})
+    message(FATAL_ERROR "JAVA_HOME must be set to build uapki-jni.cpp (need jni.h)")
+endif()
+target_include_directories(uapki PRIVATE
+    "$ENV{JAVA_HOME}/include"
+    "$ENV{JAVA_HOME}/include/linux"
+)
+
 set_target_properties(${PROJECT_NAME} PROPERTIES C_VISIBILITY_PRESET hidden)
 set_target_properties(${PROJECT_NAME} PROPERTIES CXX_VISIBILITY_PRESET hidden)
 
