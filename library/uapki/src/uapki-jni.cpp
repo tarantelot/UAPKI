@@ -32,8 +32,24 @@
 #include "oid-utils.h"
 #include "uapki-ns-util.h"
 #include "hash.h"
+#include "global-objects.h"
+#include "cer-store.h"
+
+//  Same fixed TSP endpoint CryptoController.java's TSP_URL hardcodes,
+//  regardless of which CA issued the signer's own certificate. UAPKI's own
+//  default (tsp.forced=false) would instead read the TSP URI out of the
+//  signer cert's own subjectInfoAccess extension - not what crypto-service
+//  currently does for every customer, so this is set explicitly rather
+//  than left to the library default. See setupTsp() in doc-sign.cpp.
+static const char* TSP_URL = "http://acsk.privatbank.ua/services/tsp/";
 
 namespace {
+
+//  Forward declarations - definitions further down are ordered for
+//  readability (helpers, then the two open/select/cache building blocks,
+//  then signCore which uses both), not top-to-bottom dependency order.
+int openAndSelectFirstKey(JNIEnv* env, CmStorageProxy& storage, const std::string& path, const std::string& password);
+int addCertToCache(const ByteArray* certBa, ByteArray** certId);
 
 std::string jstringToStd(JNIEnv* env, jstring s) {
     if (!s) return std::string();
@@ -170,6 +186,140 @@ int openAndSelectFirstKey(JNIEnv* env, CmStorageProxy& storage, const std::strin
     return RET_OK;
 }
 
+//  Shared core for nativeSignData/nativeSignAndSetData: open+select the
+//  key, add the caller-supplied certificate to the cache (Cryptonite always
+//  reads and passes this too, regardless of includeCert - see
+//  getUserKeyCert() in CryptoController.java), sign, close. Takes
+//  ownership of jvSignParams (attaches it to the request and frees it
+//  together with the rest). Returns the decoded signature bytes, or
+//  nullptr with a pending Java exception.
+jbyteArray signCore(JNIEnv* env, const std::string& path, const std::string& password,
+        jbyteArray jData, jbyteArray jCertBytes, JSON_Value* jvSignParams) {
+    CmStorageProxy storage;
+    if (openAndSelectFirstKey(env, storage, path, password) != RET_OK) {
+        json_value_free(jvSignParams);
+        return nullptr;
+    }
+
+    ByteArray* certBa = jbyteArrayToBa(env, jCertBytes);
+    if (certBa) {
+        ByteArray* certId = nullptr;
+        int certRet = addCertToCache(certBa, &certId);
+        ba_free(certBa);
+        if (certRet != RET_OK) {
+            storage.storageClose();
+            json_value_free(jvSignParams);
+            throwCryptoException(env, "addCertToCache failed: " + std::to_string(certRet));
+            return nullptr;
+        }
+        //  See addCertToCache's comment: without this, sign.cpp's cerSigner
+        //  lookup falls back to getCertByKeyId(storage->getSelectedKeyId()),
+        //  which does not correlate for an externally-supplied cert.
+        certRet = storage.setPairedCertId(certId);
+        ba_free(certId);
+        if (certRet != RET_OK) {
+            storage.storageClose();
+            json_value_free(jvSignParams);
+            throwCryptoException(env, "setPairedCertId failed: " + std::to_string(certRet));
+            return nullptr;
+        }
+    }
+
+    ByteArray* baData = jbyteArrayToBa(env, jData);
+
+    JSON_Value* jvParams = json_value_init_object();
+    JSON_Object* joParams = json_value_get_object(jvParams);
+    json_object_set_value(joParams, "signParams", jvSignParams);
+
+    //  Cryptonite's TSP path never does OCSP/CRL chain validation before
+    //  timestamping - it just fetches a timestamp from TSP_URL. UAPKI's
+    //  CAdES-T format otherwise runs cert_validator.getStatus() first,
+    //  which needs the signer's full CA chain resolvable in the cert cache
+    //  (RET_UAPKI_CERT_ISSUER_NOT_FOUND otherwise, since only the leaf cert
+    //  is ever added here - see addCertToCache). ignoreCertStatus skips
+    //  that validation, matching Cryptonite's simpler behavior exactly.
+    JSON_Value* jvOptions = json_value_init_object();
+    json_object_set_boolean(json_value_get_object(jvOptions), "ignoreCertStatus", 1);
+    json_object_set_value(joParams, "options", jvOptions);
+
+    JSON_Value* jvDataTbs = json_value_init_array();
+    JSON_Array* jaDataTbs = json_value_get_array(jvDataTbs);
+    JSON_Value* jvDoc = json_value_init_object();
+    JSON_Object* joDoc = json_value_get_object(jvDoc);
+    json_object_set_string(joDoc, "id", "doc-0");
+    json_object_set_base64(joDoc, "bytes", baData);
+    json_array_append_value(jaDataTbs, jvDoc);
+    json_object_set_value(joParams, "dataTbs", jvDataTbs);
+
+    JSON_Value* jvResult = json_value_init_object();
+    JSON_Object* joResult = json_value_get_object(jvResult);
+
+    int ret = uapki_sign_with_storage(storage, joParams, joResult);
+    if (ret != RET_OK) {
+        for (const ErrorCtx* e = stacktrace_get_last(); e; e = e->next) {
+            fprintf(stderr, "[uapki-jni] stacktrace: %s:%zu code=%d\n", e->file, e->line, e->error_code);
+        }
+    }
+
+    jbyteArray out = nullptr;
+    if (ret == RET_OK) {
+        JSON_Array* jaSignatures = json_object_get_array(joResult, "signatures");
+        if (jaSignatures && json_array_get_count(jaSignatures) > 0) {
+            JSON_Object* joSig = json_array_get_object(jaSignatures, 0);
+            ByteArray* baSig = json_object_get_base64(joSig, "bytes");
+            out = baToJbyteArray(env, baSig);
+            ba_free(baSig);
+        }
+    }
+
+    ba_free(baData);
+    json_value_free(jvParams);
+    json_value_free(jvResult);
+    storage.storageClose();
+
+    if (!out) {
+        throwCryptoException(env, "sign failed: " + std::to_string(ret));
+        return nullptr;
+    }
+    return out;
+}
+
+//  Cryptonite always reads the signer's certificate from a separate .cer
+//  file (getUserKeyCert()) rather than trusting anything embedded in the
+//  PKCS12 container - our real-world containers don't embed certs at all.
+//  Same here: the caller supplies the cert bytes, and this adds them to
+//  UapkiNS::get_cerstore() (a shared, MT-safe cache per UAPKI's own docs -
+//  ADD_CERT/CERT_INFO/GET_CERT are all classified MT).
+//
+//  Returns the cert's own certId via *certId (caller ba_free()s it) so the
+//  caller can storage->setPairedCertId() it. sign.cpp's cerSigner lookup
+//  prefers getCertByCertId() when a paired cert id is set, and falls back
+//  to getCertByKeyId(storage->getSelectedKeyId()) otherwise - but that
+//  fallback only works when the cert came from the SAME pkcs12 container
+//  (via keyGetCertificates(), which correlates cm-pkcs12's own internal key
+//  id with the embedded cert). For an externally-supplied .cer like this
+//  one, CerStore computes its own keyId from the certificate's public key,
+//  which has no reason to equal cm-pkcs12's internal key id - so relying on
+//  getCertByKeyId() 404s with RET_UAPKI_CERT_NOT_FOUND even though the cert
+//  was added successfully. Explicit setPairedCertId() sidesteps that.
+int addCertToCache(const ByteArray* certBa, ByteArray** certId) {
+    if (!certBa) return RET_UAPKI_INVALID_PARAMETER;
+
+    //  VectorBA's destructor ba_free()s every element it holds (see
+    //  uapki-ns.h) - push a copy, not the caller's own certBa, or the
+    //  caller's copy gets double-freed when this VectorBA goes out of scope.
+    UapkiNS::VectorBA vbaCerts;
+    vbaCerts.push_back(ba_copy_with_alloc(certBa, 0, 0));
+
+    std::vector<UapkiNS::Cert::CerStore::AddedCerItem> addedItems;
+    int ret = UapkiNS::get_cerstore()->addCerts(false, false, vbaCerts, addedItems);
+    if (ret != RET_OK) return ret;
+    if (addedItems.empty()) return RET_UAPKI_GENERAL_ERROR;
+    if (addedItems[0].errorCode != RET_OK) return addedItems[0].errorCode;
+    if (certId) *certId = ba_copy_with_alloc(addedItems[0].cerItem->getCertId(), 0, 0);
+    return RET_OK;
+}
+
 }  // namespace
 
 extern "C" {
@@ -188,7 +338,11 @@ JNIEXPORT jboolean JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeInit(
 
     JSON_Value* jvParams = json_value_init_object();
     JSON_Object* joParams = json_value_get_object(jvParams);
-    json_object_set_boolean(joParams, "offline", 1);
+    //  offline=false: TSP timestamping (nativeSignData's withTimestamp) needs
+    //  an actual network call to TSP_URL. offline=true would make sign.cpp
+    //  reject any includeContentTS/includeSignatureTS request outright
+    //  (RET_UAPKI_OFFLINE_MODE) before it ever reached the network.
+    json_object_set_boolean(joParams, "offline", 0);
 
     JSON_Value* jvCertCache = json_value_init_object();
     json_object_set_string(json_value_get_object(jvCertCache), "path", certCacheDir.c_str());
@@ -197,6 +351,21 @@ JNIEXPORT jboolean JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeInit(
     JSON_Value* jvCrlCache = json_value_init_object();
     json_object_set_string(json_value_get_object(jvCrlCache), "path", crlCacheDir.c_str());
     json_object_set_value(joParams, "crlCache", jvCrlCache);
+
+    //  Force the same fixed TSP endpoint Cryptonite always uses (see
+    //  TSP_URL comment above) rather than UAPKI's default of trusting the
+    //  signer cert's own subjectInfoAccess TSP URI.
+    JSON_Value* jvTsp = json_value_init_object();
+    JSON_Object* joTsp = json_value_get_object(jvTsp);
+    json_object_set_boolean(joTsp, "forced", 1);
+    json_object_set_string(joTsp, "url", TSP_URL);
+    //  certReq=true: ask the TSA to embed its signing cert in the response.
+    //  Without it, doc-sign.cpp's verifySignedData() adds zero certs from
+    //  an empty response cert list, and the subsequent SID-based
+    //  getCertByKeyId() lookup 404s with RET_UAPKI_CERT_NOT_FOUND - not a
+    //  lookup bug, just nothing was ever added to look up.
+    json_object_set_boolean(joTsp, "certReq", 1);
+    json_object_set_value(joParams, "tsp", jvTsp);
 
     //  cm-pkcs12's provider_init() sets a single process-wide static (see
     //  openAndSelectFirstKey's comment) - call it exactly once here, via a
@@ -249,69 +418,88 @@ JNIEXPORT jboolean JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeIsKeyPass
     return (ret == RET_OK) ? JNI_TRUE : JNI_FALSE;
 }
 
+//  Matches CryptoController.signData()'s exact parameter set and behavior:
+//  - withTimestamp maps to CAdES-T (which auto-sets both includeContentTS
+//    and includeSignatureTS - see paramsBySignatureFormat() in
+//    doc-sign.cpp), CMS format otherwise. Cryptonite's TSP_URL is forced
+//    globally in nativeInit(), matching what CryptoniteX.cmsSignData did
+//    with the TSP_URL constant.
+//  - certBytes is read (by the Java caller, from certificateKeyPath) and
+//    passed through unconditionally, exactly like getUserKeyCert() does -
+//    Cryptonite always loads the cert file regardless of includeCertificate.
 JNIEXPORT jbyteArray JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeSignData(
         JNIEnv* env, jclass,
         jstring jPath, jstring jPassword, jbyteArray jData,
-        jboolean includeData, jboolean includeCert, jboolean includeTime) {
+        jboolean includeData, jboolean withTimestamp,
+        jbyteArray jCertBytes, jboolean includeCertificate) {
 
     std::string path = jstringToStd(env, jPath);
     std::string password = jstringToStd(env, jPassword);
 
-    CmStorageProxy storage;
-    if (openAndSelectFirstKey(env, storage, path, password) != RET_OK) {
+    JSON_Value* jvSignParams = json_value_init_object();
+    JSON_Object* joSignParams = json_value_get_object(jvSignParams);
+    json_object_set_string(joSignParams, "signatureFormat", withTimestamp ? "CAdES-T" : "CMS");
+    json_object_set_boolean(joSignParams, "detachedData", !includeData);
+    json_object_set_boolean(joSignParams, "includeCert", includeCertificate);
+
+    return signCore(env, path, password, jData, jCertBytes, jvSignParams);
+}
+
+//  Matches CryptoController.signAndSetData()'s exact (hardcoded) behavior:
+//  sign detached with the cert embedded and no TSP - despite the Java
+//  method's local `withTimeStamp = true`, it passes a null TSP URL to
+//  CryptoniteX.cmsSignData specifically "in order to omit setting
+//  timestamp on data" (see that method's comment), so the actual signature
+//  here carries no timestamp either. Then attach the plaintext content via
+//  MODIFY_CMS (add.content), matching CryptoniteX.cmsSetData(sign, data) -
+//  it verifies the digest matches before rebuilding, same as that call.
+JNIEXPORT jbyteArray JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeSignAndSetData(
+        JNIEnv* env, jclass,
+        jstring jPath, jstring jPassword, jbyteArray jData, jbyteArray jCertBytes) {
+
+    std::string path = jstringToStd(env, jPath);
+    std::string password = jstringToStd(env, jPassword);
+
+    JSON_Value* jvSignParams = json_value_init_object();
+    JSON_Object* joSignParams = json_value_get_object(jvSignParams);
+    json_object_set_string(joSignParams, "signatureFormat", "CMS");
+    json_object_set_boolean(joSignParams, "detachedData", true);
+    json_object_set_boolean(joSignParams, "includeCert", true);
+
+    jbyteArray detachedSig = signCore(env, path, password, jData, jCertBytes, jvSignParams);
+    if (!detachedSig) {
         return nullptr;
     }
 
+    ByteArray* baSig = jbyteArrayToBa(env, detachedSig);
     ByteArray* baData = jbyteArrayToBa(env, jData);
 
     JSON_Value* jvParams = json_value_init_object();
     JSON_Object* joParams = json_value_get_object(jvParams);
-    JSON_Value* jvSignParams = json_value_init_object();
-    JSON_Object* joSignParams = json_value_get_object(jvSignParams);
-    json_object_set_string(joSignParams, "signatureFormat", "CMS");
-    json_object_set_boolean(joSignParams, "detachedData", !includeData);
-    json_object_set_boolean(joSignParams, "includeCert", includeCert);
-    json_object_set_boolean(joSignParams, "includeTime", includeTime);
-    json_object_set_boolean(joSignParams, "includeContentTS", 0);
-    json_object_set_value(joParams, "signParams", jvSignParams);
-
-    JSON_Value* jvDataTbs = json_value_init_array();
-    JSON_Array* jaDataTbs = json_value_get_array(jvDataTbs);
-    JSON_Value* jvDoc = json_value_init_object();
-    JSON_Object* joDoc = json_value_get_object(jvDoc);
-    json_object_set_string(joDoc, "id", "doc-0");
-    json_object_set_base64(joDoc, "bytes", baData);
-    json_array_append_value(jaDataTbs, jvDoc);
-    json_object_set_value(joParams, "dataTbs", jvDataTbs);
+    json_object_set_base64(joParams, "bytes", baSig);
+    JSON_Value* jvAdd = json_value_init_object();
+    json_object_set_base64(json_value_get_object(jvAdd), "content", baData);
+    json_object_set_value(joParams, "add", jvAdd);
 
     JSON_Value* jvResult = json_value_init_object();
     JSON_Object* joResult = json_value_get_object(jvResult);
 
-    int ret = uapki_sign_with_storage(storage, joParams, joResult);
-    if (ret != RET_OK) {
-        for (const ErrorCtx* e = stacktrace_get_last(); e; e = e->next) {
-            fprintf(stderr, "[uapki-jni] stacktrace: %s:%zu code=%d\n", e->file, e->line, e->error_code);
-        }
-    }
+    int ret = uapki_modify_cms(joParams, joResult);
 
     jbyteArray out = nullptr;
     if (ret == RET_OK) {
-        JSON_Array* jaSignatures = json_object_get_array(joResult, "signatures");
-        if (jaSignatures && json_array_get_count(jaSignatures) > 0) {
-            JSON_Object* joSig = json_array_get_object(jaSignatures, 0);
-            ByteArray* baSig = json_object_get_base64(joSig, "bytes");
-            out = baToJbyteArray(env, baSig);
-            ba_free(baSig);
-        }
+        ByteArray* baOut = json_object_get_base64(joResult, "bytes");
+        out = baToJbyteArray(env, baOut);
+        ba_free(baOut);
     }
 
+    ba_free(baSig);
     ba_free(baData);
     json_value_free(jvParams);
     json_value_free(jvResult);
-    storage.storageClose();
 
     if (!out) {
-        throwCryptoException(env, "sign failed: " + std::to_string(ret));
+        throwCryptoException(env, "modify_cms (attach content) failed: " + std::to_string(ret));
         return nullptr;
     }
     return out;
