@@ -38,6 +38,7 @@
 #include "oid-utils.h"
 #include "IITParams.h"
 #include "cm-errors.h"
+#include "kdf-cache.h"
 
 #define DEBUG_OUTCON(expression)
 #ifndef DEBUG_OUTCON
@@ -303,6 +304,7 @@ int pbes2_crypt(CryptDirection direction, const PBES2_params_t *params, const ch
     ByteArray* iv = NULL;
     ByteArray* tmp = NULL;
     HashAlg hash_alg = HASH_ALG_UNDEFINED;
+    KdfCacheKind kdf_kind = KDF_CACHE_PBKDF2;
     AesCtx* aes_ctx = NULL;
     DesCtx* des_ctx = NULL;
     char* oid = NULL;
@@ -333,14 +335,23 @@ int pbes2_crypt(CryptDirection direction, const PBES2_params_t *params, const ch
     DO(asn_oid_to_text(&params->encryptionScheme.algorithm, &crypt_oid));
     DO(crypt_get_key_len_by_oid(crypt_oid, &key_len));
     
-    switch (hash_alg) {
-    case HASH_ALG_DSTU7564_256:
-    case HASH_ALG_DSTU7564_384:
-    case HASH_ALG_DSTU7564_512:
-        DO(pbkdf2_dstu7564kmac(pass, salt, iterations, key_len, hash_alg, &dk));
-        break;
-    default:
-        DO(pbkdf2(pass, salt, iterations, key_len, hash_alg, &dk));
+    //  Decrypting: the derivation from kdf-cache when this password already derived it (kdf-cache.h),
+    //  else computed - and stored when the caller has the password proven.
+    kdf_kind = ((hash_alg == HASH_ALG_DSTU7564_256) || (hash_alg == HASH_ALG_DSTU7564_384) || (hash_alg == HASH_ALG_DSTU7564_512))
+        ? KDF_CACHE_PBKDF2_DSTU7564KMAC : KDF_CACHE_PBKDF2;
+    if ((direction != DIRECTION_DECRYPT) || !kdf_cache_get(kdf_kind, 0, hash_alg, salt, iterations, key_len, pass, &dk)) {
+        switch (hash_alg) {
+        case HASH_ALG_DSTU7564_256:
+        case HASH_ALG_DSTU7564_384:
+        case HASH_ALG_DSTU7564_512:
+            DO(pbkdf2_dstu7564kmac(pass, salt, iterations, key_len, hash_alg, &dk));
+            break;
+        default:
+            DO(pbkdf2(pass, salt, iterations, key_len, hash_alg, &dk));
+        }
+        if (direction == DIRECTION_DECRYPT) {
+            kdf_cache_put(kdf_kind, 0, hash_alg, salt, iterations, key_len, pass, dk);
+        }
     }
 
     if (oid_is_parent(OID_DSTU7624_256_CBC, crypt_oid)) {
@@ -432,8 +443,15 @@ int pbes1_crypt(CryptDirection direction, const PBKDF2_params_t* params,
     DO(asn_INTEGER2ulong(&params->iterationCount, &iterations));
     DO(asn_OCTSTRING2ba(&params->salt.choice.specified, &salt));
 
-    DO(pbkdf1(pass, salt, 1, iterations, 24, HASH_ALG_SHA1, &dk));
-    DO(pbkdf1(pass, salt, 2, iterations, 8, HASH_ALG_SHA1, &iv));
+    //  Decrypting: from kdf-cache when this password already derived them (kdf-cache.h).
+    if ((direction != DIRECTION_DECRYPT) || !kdf_cache_get(KDF_CACHE_PKCS12, 1, HASH_ALG_SHA1, salt, iterations, 24, pass, &dk)) {
+        DO(pbkdf1(pass, salt, 1, iterations, 24, HASH_ALG_SHA1, &dk));
+        if (direction == DIRECTION_DECRYPT) kdf_cache_put(KDF_CACHE_PKCS12, 1, HASH_ALG_SHA1, salt, iterations, 24, pass, dk);
+    }
+    if ((direction != DIRECTION_DECRYPT) || !kdf_cache_get(KDF_CACHE_PKCS12, 2, HASH_ALG_SHA1, salt, iterations, 8, pass, &iv)) {
+        DO(pbkdf1(pass, salt, 2, iterations, 8, HASH_ALG_SHA1, &iv));
+        if (direction == DIRECTION_DECRYPT) kdf_cache_put(KDF_CACHE_PKCS12, 2, HASH_ALG_SHA1, salt, iterations, 8, pass, iv);
+    }
 
     CHECK_NOT_NULL(des_ctx = des_alloc());
     DO(des_init_cbc(des_ctx, dk, iv));
@@ -451,7 +469,7 @@ cleanup:
 
     ba_free(iv);
     ba_free(tmp);
-    ba_free(dk);
+    ba_free_private(dk);
     ba_free(salt);
     des_free(des_ctx);
 

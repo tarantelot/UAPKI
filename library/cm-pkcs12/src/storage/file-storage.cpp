@@ -38,6 +38,7 @@
 #include "iconv-utils.h"
 #include "macros-internal.h"
 #include "oids.h"
+#include "kdf-cache.h"
 #include "oid-utils.h"
 #include "pkcs5.h"
 #include "pkcs12-utils.h"
@@ -401,6 +402,8 @@ int FileStorage::decodePkcs12 (
     DEBUG_OUTCON(printf("FileStorage::decodePkcs12(password = '%s')\n", aPassword));
     int ret = RET_OK;
     SmartBA sba_authsafe, sba_mac_actual, sba_mac_calc;
+    bool proven = false;
+    kdf_cache_trace("decodePkcs12 begin");
 
     PFX_t* pfx = (PFX_t*)asn_decode_ba_with_alloc(get_PFX_desc(), m_Buffer);
     if (!pfx) {
@@ -419,9 +422,17 @@ int FileStorage::decodePkcs12 (
         SET_ERROR(RET_CM_INVALID_MAC);
     }
 
+    //  The MAC matched: the password is proven - its MAC derivation and the ones decrypting the contents
+    //  below go into kdf-cache (kdf-cache.h). A mismatch stored nothing.
+    kdf_cache_commit_pending();
+    kdf_cache_proven_begin();
+    proven = true;
     DO(readContents(sba_authsafe.get(), aPassword));
 
 cleanup:
+    kdf_cache_trace("decodePkcs12 end");
+    if (proven) kdf_cache_proven_end();
+    kdf_cache_drop_pending();
     asn_free(get_PFX_desc(), pfx);
     return ret;
 }

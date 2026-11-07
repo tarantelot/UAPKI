@@ -35,6 +35,7 @@
 #include "oid-utils.h"
 #include "pkcs5.h"
 #include "cm-errors.h"
+#include "kdf-cache.h"
 
 
 #define DEBUG_OUTCON(expression)
@@ -106,7 +107,13 @@ int pkcs12_get_data_and_calc_mac (const PFX_t * pfx, const char * pass,
     DO(asn_OCTSTRING2ba(&pfx->macData->macSalt, &salt));
     DO(asn_INTEGER2ulong(pfx->macData->iterations, &iter));
 
-    DO(pbkdf1(pass, salt, 3, iter, 0, hash_algo, &dk));
+    //  The MAC key from kdf-cache when this password already derived it; else computed and held as this
+    //  thread's pending derivation, stored only once the caller found the MAC matching (kdf-cache.h).
+    kdf_cache_drop_pending();
+    if (!kdf_cache_get(KDF_CACHE_PKCS12, 3, hash_algo, salt, iter, 0, pass, &dk)) {
+        DO(pbkdf1(pass, salt, 3, iter, 0, hash_algo, &dk));
+        kdf_cache_set_pending(KDF_CACHE_PKCS12, 3, hash_algo, salt, iter, 0, pass, dk);
+    }
     DO(cinfo_get_data(&pfx->authSafe, baAuthsafe));
     if (!oid_is_equal(OID_DSTU7564_256, s_oid)) {
         DO(pkcs12_calc_hmac(hash_algo, dk, *baAuthsafe, baMacValue));
@@ -120,7 +127,7 @@ int pkcs12_get_data_and_calc_mac (const PFX_t * pfx, const char * pass,
 
 cleanup:
     ba_free(salt);
-    ba_free(dk);
+    ba_free_private(dk);
     free(s_oid);
     return ret;
 }   //  pkcs12_get_data_and_calc_mac

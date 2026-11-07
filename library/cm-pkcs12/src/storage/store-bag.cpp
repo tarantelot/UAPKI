@@ -36,6 +36,7 @@
 #include "pkcs5.h"
 #include "pkcs12-utils.h"
 #include "private-key.h"
+#include "kdf-cache.h"
 #include "uapki-ns-util.h"
 
 
@@ -198,7 +199,7 @@ bool StoreBag::getKeyInfo (
     keyInfo.parameterId = parameterId();
 
     SmartBA sba_pubkey, sba_spki;
-    if ((private_key_get_spki(bagValue(), &sba_spki) == RET_OK) &&
+    if ((kdf_cache_private_key_get_spki(bagValue(), &sba_spki) == RET_OK) &&
         (spki_get_pubkey(sba_spki.get(), &sba_pubkey) == RET_OK)) {
         if ((ba_to_base64_with_alloc(sba_pubkey.get(), &s_param) == RET_OK) && s_param) {
             keyInfo.publicKey = string(s_param);
@@ -282,7 +283,10 @@ void StoreBag::setData (
             free(s_param2);
             s_param1 = nullptr;
             s_param2 = nullptr;
-            if (keyid_by_privkeyinfo(aBagValue, &m_KeyId) == RET_OK) {
+            //  keyid_by_privkeyinfo(), its public key through kdf-cache (kdf-cache.h)
+            SmartBA sba_spki;
+            if ((kdf_cache_private_key_get_spki(aBagValue, &sba_spki) == RET_OK) &&
+                (spki_get_key_id(sba_spki.get(), &m_KeyId) == RET_OK)) {
                 m_BagType = BAG_TYPE::KEY;
                 if (oid_is_parent(OID_DSTU4145_WITH_DSTU7564, m_MechanismId.c_str()) ||
                     oid_is_parent(OID_DSTU4145_WITH_GOST3411, m_MechanismId.c_str())
@@ -378,7 +382,7 @@ bool StoreBag::keyIdFromPrivKeyInfo (
 )
 {
     SmartBA sba_pubkey, sba_spki;
-    if (private_key_get_spki(baPrivKeyInfo, &sba_spki) != RET_OK) return false;
+    if (kdf_cache_private_key_get_spki(baPrivKeyInfo, &sba_spki) != RET_OK) return false;
     if (spki_get_subject_publickey(sba_spki.get(), &sba_pubkey) != RET_OK) return false;
     if (::hash(hashAlg, sba_pubkey.get(), baKeyId) != RET_OK) return false;
     return true;
