@@ -44,6 +44,7 @@
 #include "uapki-errors.h"
 #include "uapki-ns.h"
 #include <string.h>
+#include <stdlib.h>
 #include <map>
 #include <mutex>
 
@@ -107,6 +108,22 @@ static size_t cb_curlwrite (
 
     return realsize;
 }   //  cb_curlwrite
+
+//  HttpHelper::post's curl handle, one per thread, kept between requests: curl reuses its open
+//  connection to the same host (keep-alive) - a timestamp request skips the TCP connect and the DNS
+//  lookup. curl_easy_reset() before each request clears the options, not the connection. A handle is
+//  never shared between threads. UAPKI_HTTP_REUSE=0: a fresh handle per request, closed after it.
+struct ThreadCurl {
+    CURL* handle = nullptr;
+    ~ThreadCurl () { if (handle) curl_easy_cleanup(handle); }
+};
+static thread_local ThreadCurl t_post_curl;
+
+static bool post_connection_reuse (void)
+{
+    static const bool on = !(getenv("UAPKI_HTTP_REUSE") && (strcmp(getenv("UAPKI_HTTP_REUSE"), "0") == 0));
+    return on;
+}
 
 static bool curl_set_url_and_proxy (
         CURL* curl,
@@ -493,15 +510,22 @@ int HttpHelper::post (
     int ret;
 
 #if !defined(ANDROID) && !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
-    // get a curl handle 
-    CURL* curl = nullptr;
-    if ((curl = curl_easy_init()) == nullptr) {
-        return RET_UAPKI_CONNECTION_ERROR;
+    // get a curl handle: this thread's kept one (see ThreadCurl), reset, or a new one
+    const bool reuse = post_connection_reuse();
+    CURL* curl = reuse ? t_post_curl.handle : nullptr;
+    if (curl) {
+        curl_easy_reset(curl);
+    }
+    else {
+        if ((curl = curl_easy_init()) == nullptr) {
+            return RET_UAPKI_CONNECTION_ERROR;
+        }
+        if (reuse) t_post_curl.handle = curl;
     }
 
     struct curl_slist* chunk = NULL;
 
-    // Add a custom header 
+    // Add a custom header
     chunk = curl_slist_append(chunk, contentType);
 
     // set our custom set of headers
@@ -510,6 +534,9 @@ int HttpHelper::post (
     // First set the URL that is about to receive our POST. This URL can
     // just as well be a https:// URL if that is what should receive the data.
     if (!curl_set_url_and_proxy(curl, uri)) {
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
+        curl_slist_free_all(chunk);
+        if (!reuse) curl_easy_cleanup(curl);
         return RET_UAPKI_CONNECTION_ERROR;
     }
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
@@ -538,8 +565,11 @@ int HttpHelper::post (
         ret = RET_UAPKI_CONNECTION_ERROR;
     }
 
-    // always cleanup
-    curl_easy_cleanup(curl);
+    // the options point at this call's buffers: unset them; keep the handle (and its connection) when reused
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, NULL);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, NULL);
+    if (!reuse) curl_easy_cleanup(curl);
     curl_slist_free_all(chunk);
 #elif defined(ANDROID) || defined(__ANDROID__)
     if (!g_JniHelper.env) return RET_UAPKI_NOT_INITIALIZED;

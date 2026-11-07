@@ -15,6 +15,10 @@
 
 #include <jni.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -469,9 +473,16 @@ JNIEXPORT jboolean JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeIsKeyPass
 }
 
 //  Matches CryptoController.signData()'s exact parameter set and behavior:
-//  - Always uses CAdES-T (always fetches a real TSP timestamp), regardless
-//    of withTimestamp. This looks wrong until you read cmsSignData's own
-//    body (CryptoniteX.java): TSP only gates on `tspURL != null`, and
+//  - Always fetches a real TSP timestamp, regardless of withTimestamp: ONE,
+//    on the content (a signed attribute, CAdES-BES + includeContentTS) - what
+//    Cryptonite's cmsSignData produced (createTSP over the data's hash, put
+//    into the signed attributes by cmsGenerateSignAttrs) and the DPS accepted
+//    for years. UAPKI's CAdES-T adds a second one, on the signature (an
+//    unsigned attribute): a second round trip to the TSP (~84 ms of ~172 ms
+//    per signature) that Cryptonite never made. UAPKI_SIGNATURE_TS=1 brings
+//    CAdES-T back (both timestamps).
+//  - Why a timestamp at all, whatever withTimestamp says - in Cryptonite's
+//    cmsSignData (CryptoniteX.java) TSP only gates on `tspURL != null`, and
 //    signData() always passes the hardcoded TSP_URL - `withTimestamp`
 //    (Cryptonite's `includeSignTime`) only controls a SEPARATE, minor
 //    local signingTime signed attribute, unrelated to whether a TSP
@@ -496,9 +507,15 @@ JNIEXPORT jbyteArray JNICALL Java_com_tarantelot_uapki_UapkiNative_nativeSignDat
     std::string password = jstringToStd(env, jPassword);
     (void)withTimestamp;
 
+    const char* signature_ts = std::getenv("UAPKI_SIGNATURE_TS");
+    const bool both_timestamps = signature_ts && (std::strcmp(signature_ts, "1") == 0);
+
     JSON_Value* jvSignParams = json_value_init_object();
     JSON_Object* joSignParams = json_value_get_object(jvSignParams);
-    json_object_set_string(joSignParams, "signatureFormat", "CAdES-T");
+    json_object_set_string(joSignParams, "signatureFormat", both_timestamps ? "CAdES-T" : "CAdES-BES");
+    if (!both_timestamps) {
+        json_object_set_boolean(joSignParams, "includeContentTS", 1);
+    }
     json_object_set_boolean(joSignParams, "detachedData", !includeData);
     json_object_set_boolean(joSignParams, "includeCert", includeCertificate);
 
